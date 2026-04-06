@@ -1,7 +1,16 @@
+name: Scraper & Pricer Workflow
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
 jobs:
   scraper:
-    # mevcut scraper job'ı — saatlik çalışır
-    
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
   pricer:
     runs-on: ubuntu-latest
     steps:
