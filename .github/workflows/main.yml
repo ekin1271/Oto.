@@ -1,0 +1,19 @@
+jobs:
+  scraper:
+    # mevcut scraper job'ı — saatlik çalışır
+    
+  pricer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - name: Pricer bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.CHAT_ID }}
+          PARTNER_USER: ${{ secrets.PARTNER_USER }}
+          PARTNER_PASS: ${{ secrets.PARTNER_PASS }}
+        run: timeout 3300 node pricer.js || true
