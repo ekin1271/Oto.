@@ -1,0 +1,8 @@
+{
+  "name": "peninsula-price-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "puppeteer": "^23.0.0"
+  }
+}
