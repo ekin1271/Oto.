@@ -2,7 +2,7 @@ name: Peninsula Price Monitor
 
 on:
   schedule:
-    - cron: '0 * * * *'   # Scraper: saatlik otomatik
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: State cache yükle
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: price_state.json
           key: price-state-${{ github.run_id }}
@@ -64,4 +64,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: price_state.json
-          key: price-state-${{ github.run_id }}
+          key: price-state-${{ github.run_id }}-${{ github.run_attempt }}
