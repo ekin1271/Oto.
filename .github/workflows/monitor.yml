@@ -1,4 +1,4 @@
-name:  Price Monitor
+name: Peninsula Price Monitor
 
 on:
   schedule:
@@ -35,10 +35,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Bağımlılıkları yükle
-        run: npm ci
+        run: npm install puppeteer
 
       - name: Chrome kur
         run: npx puppeteer browsers install chrome
