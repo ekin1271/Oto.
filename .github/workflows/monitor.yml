@@ -1,0 +1,68 @@
+name:  Price Monitor
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # Scraper: saatlik otomatik
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Çalışma modu'
+        required: true
+        default: 'scraper'
+        type: choice
+        options:
+          - scraper
+          - pricer
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: State cache yükle
+        uses: actions/cache@v4
+        with:
+          path: price_state.json
+          key: price-state-${{ github.run_id }}
+          restore-keys: |
+            price-state-
+
+      - name: Node.js kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Bağımlılıkları yükle
+        run: npm ci
+
+      - name: Chrome kur
+        run: npx puppeteer browsers install chrome
+
+      - name: Scraper çalıştır
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'scraper' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.CHAT_ID }}
+          GROUP_CHAT_ID:      ${{ secrets.GROUP_CHAT_ID }}
+        run: node scraper.js
+
+      - name: Pricer çalıştır
+        if: ${{ inputs.mode == 'pricer' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.CHAT_ID }}
+          PARTNER_USER:       ${{ secrets.PARTNER_USER }}
+          PARTNER_PASS:       ${{ secrets.PARTNER_PASS }}
+        run: node pricer.js
+
+      - name: State cache kaydet
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: price_state.json
+          key: price-state-${{ github.run_id }}
