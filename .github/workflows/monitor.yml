@@ -1,4 +1,4 @@
-name: Peninsula Price Monitor
+name: Price Monitor
 
 on:
   schedule:
