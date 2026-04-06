@@ -1,4 +1,8 @@
 {
+  "_default": { "maxDiff": 3, "dailyLimit": 3 },
+  "102625109603": { "maxDiff": 3, "dailyLimit": 3 },
+  "102610148746": { "maxDiff": 3, "dailyLimit": 3 },
+  "102626032378": { "maxDiff": 3, "dailyLimit": 3 },
   "102626024943": { "maxDiff": 3, "dailyLimit": 3 },
  
 }
