@@ -1,13 +1,10 @@
 /**
- * monitor.js  v3
- * BGOperator fiyat tarama + rakip karşılaştırma + Telegram bildirimi
+ * monitor.js  v4
  *
- * DEĞİŞİKLİKLER:
- * - Her otel × her tarih için ayrı mesaj + ayrı "Öne Geç" butonu
- * - State: ahead/behind/priced sürekli güncellenir
- * - 'priced' (biz öne geçirdik) sonrası rakip tekrar önüne geçerse bildirim gelir
- * - Halihazırda 'ahead' olan için tekrar bildirim yok
- * - En sonda özet mesaj + "Pricer'ı Kapat" butonu
+ * DEĞİŞİKLİKLER v3'e göre:
+ * - TELEGRAM_CHAT_ID boş olsa bile GROUP_CHAT_ID varsa oraya da butonlu mesaj gider
+ * - Her uyarı için buton gönderimi ayrı fonksiyona alındı, log eklendi
+ * - Buton gönderilip gönderilmediği console'a yazılıyor
  * - Pricer otomatik spawn edilir
  */
 
@@ -35,7 +32,7 @@ function loadHotels() {
   return [];
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function fmtN(n)  { return String(n).padStart(2, '0'); }
+function fmtN(n)   { return String(n).padStart(2, '0'); }
 
 function generateDates() {
   const dates = [];
@@ -72,15 +69,54 @@ function generateUrls(hotels) {
 // ─── Telegram ────────────────────────────────────────────────────────────────
 function telegramPost(chatId, body) {
   return new Promise(resolve => {
-    const data = JSON.stringify({ chat_id: chatId, parse_mode: 'HTML', disable_web_page_preview: true, ...body });
-    const req  = https.request(
+    const payload = JSON.stringify({
+      chat_id: chatId,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...body,
+    });
+    const req = https.request(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } },
-      res => { res.resume(); res.on('end', resolve); }
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        },
+      },
+      res => {
+        let s = '';
+        res.on('data', d => s += d);
+        res.on('end', () => {
+          try {
+            const j = JSON.parse(s);
+            if (!j.ok) console.error('[Telegram] Hata:', JSON.stringify(j));
+          } catch {}
+          resolve();
+        });
+      }
     );
-    req.on('error', () => resolve());
-    req.write(data); req.end();
+    req.on('error', e => { console.error('[Telegram] İstek hatası:', e.message); resolve(); });
+    req.write(payload);
+    req.end();
   });
+}
+
+// Butonlu mesajı CHAT_ID'ye, butonsuz metni GROUP_ID'ye gönder
+async function sendAlert(text, replyMarkup) {
+  if (TELEGRAM_CHAT_ID) {
+    const body = { text };
+    if (replyMarkup) body.reply_markup = replyMarkup;
+    console.log(`[Telegram] CHAT_ID'ye gönderiliyor, buton: ${!!replyMarkup}`);
+    await telegramPost(TELEGRAM_CHAT_ID, body);
+  } else {
+    console.warn('[Telegram] TELEGRAM_CHAT_ID tanımlı değil! Butonlu mesaj gönderilemedi.');
+  }
+
+  if (TELEGRAM_GROUP_ID) {
+    // Gruba her zaman butonsuz
+    await telegramPost(TELEGRAM_GROUP_ID, { text });
+  }
 }
 
 // ─── Scrape ──────────────────────────────────────────────────────────────────
@@ -109,7 +145,6 @@ async function scrapePageOnce(browser, targetUrl, checkIn, hotelId) {
       let penPrice = null, penRoom = '';
       const rivals = [];
 
-      // display:none dahil tüm tr'ler
       for (const tr of block.querySelectorAll('tr')) {
         const lis = tr.querySelectorAll('li.s8.i_t1');
         if (!lis.length) continue;
@@ -162,20 +197,21 @@ function analyzeOffers(checkIn, offers, prevState, newState) {
     const prevSt = prevState[key];
     if (!o.rivals.length) { newState[key] = 'alone'; continue; }
 
-    const cheapest  = o.rivals.reduce((a, b) => a.price < b.price ? a : b);
+    const cheapest   = o.rivals.reduce((a, b) => a.price < b.price ? a : b);
     const rivalAhead = cheapest.price < o.peninsulaPrice;
     const isEqual    = cheapest.price === o.peninsulaPrice;
     const isNew      = prevSt === undefined || prevSt === 'alone';
 
-    // Yeni state — 'priced' ise koruyoruz; rakip tekrar önüne geçtiyse 'ahead'a dön
+    // State güncelle
     if (rivalAhead) {
       newState[key] = 'ahead';
     } else if (isEqual) {
       newState[key] = 'equal';
     } else {
-      // Biz öndeyiz — eğer daha önce 'priced' yapıldıysa onu koru
       newState[key] = prevSt === 'priced' ? 'priced' : 'behind';
     }
+
+    console.log(`[Analiz] ${key} | prevSt=${prevSt} | rivalAhead=${rivalAhead} | diff=${o.peninsulaPrice - cheapest.price}`);
 
     const base = {
       checkIn,
@@ -188,22 +224,15 @@ function analyzeOffers(checkIn, offers, prevState, newState) {
       rivalAhead,
     };
 
-    // Bildirim kuralları:
-    // 1. Yeni rakip girdi (isNew) → her durumda bildir
-    // 2. Daha önce behind/equal/alone/priced idiyse ve şimdi ahead → bildir
-    //    (prevSt === 'ahead' ise tekrar BILDIRIM YOK)
-    // 3. Daha önce ahead/behind idiyse ve eşit olduysa bildir
     if (isNew) {
-      if (rivalAhead) alerts.push({ ...base, type: 'ahead', diff: o.peninsulaPrice - cheapest.price, newRival: true });
-      else if (isEqual) alerts.push({ ...base, type: 'equal', diff: 0, newRival: true });
-      else alerts.push({ ...base, type: 'we_lead', diff: 0, newRival: true });
+      if (rivalAhead)  alerts.push({ ...base, type: 'ahead',   diff: o.peninsulaPrice - cheapest.price, newRival: true });
+      else if (isEqual) alerts.push({ ...base, type: 'equal',  diff: 0, newRival: true });
+      else              alerts.push({ ...base, type: 'we_lead', diff: 0, newRival: true });
     } else if (rivalAhead && prevSt !== 'ahead') {
-      // Durum değişti: behind/equal/priced → ahead
       alerts.push({ ...base, type: 'ahead', diff: o.peninsulaPrice - cheapest.price, newRival: false });
     } else if (isEqual && prevSt !== 'equal') {
       alerts.push({ ...base, type: 'equal', diff: 0, newRival: false });
     }
-    // Eğer hâlâ ahead ve prevSt === 'ahead' → bildirim yok
   }
   return alerts;
 }
@@ -214,7 +243,11 @@ function saveState(st) { fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log('=== Monitor v3 başlıyor ===');
+  console.log('=== Monitor v4 başlıyor ===');
+
+  if (!TELEGRAM_BOT_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
+  if (!TELEGRAM_CHAT_ID)   console.warn('TELEGRAM_CHAT_ID tanımlı değil — butonlu mesajlar gönderilmeyecek!');
+
   const hotels = loadHotels();
   const dates  = generateDates();
   console.log(`Otel: ${hotels.length} | Tarihler: ${dates.map(d => d.checkIn).join(', ')}`);
@@ -260,9 +293,10 @@ async function main() {
   saveState(newState);
   console.log(`State kaydedildi. ${allAlerts.length} uyarı.`);
 
-  // ─── Her uyarı → ayrı mesaj + ayrı buton ─────────────────────────────────
+  // ─── Her uyarı → ayrı mesaj ──────────────────────────────────────────────
   for (const alert of allAlerts) {
     const diff = alert.rivalAhead ? (alert.peninsulaPrice - alert.cheapestPrice) : 0;
+    const ts   = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
     let text   = `🏨 <b>${alert.hotel}</b>\n🛏 ${alert.room}\n📅 ${alert.checkIn}\n`;
 
     if (alert.type === 'equal') {
@@ -270,42 +304,42 @@ async function main() {
     } else if (alert.type === 'we_lead') {
       text += `🆕 Rakip girdi — biz öndeyiz\n📌 Peninsula: ${alert.peninsulaPrice} EUR\n🏆 ${alert.cheapestAgency}: ${alert.cheapestPrice} EUR`;
     } else {
-      // ahead
       const emoji = alert.newRival ? '🆕 Rakip girdi (gerideyiz)' : '🚨 Rakip öne geçti';
       text += `${emoji}\n📌 Peninsula: ${alert.peninsulaPrice} EUR\n⚠️ ${alert.cheapestAgency}: ${alert.cheapestPrice} EUR (Fark: ${diff} EUR)`;
     }
-    text += `\n🕐 ${new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' })}`;
+    text += `\n🕐 ${ts}`;
 
-    const body = { text };
+    let replyMarkup = null;
     if (alert.rivalAhead && diff > 0) {
       const cbKey = `approve__${alert.hotelId}__${encodeURIComponent(alert.hotel)}__${alert.checkIn}__${alert.peninsulaPrice}__${alert.cheapestPrice}`;
-      body.reply_markup = {
+      replyMarkup = {
         inline_keyboard: [[
           { text: `✅ Öne Geç (Fark: ${diff} EUR)`, callback_data: cbKey },
           { text: '❌ Geç', callback_data: `skip__${alert.hotelId}__${alert.checkIn}` },
         ]],
       };
+      console.log(`[Buton] Oluşturuldu: ${alert.hotel} | ${alert.checkIn} | Fark: ${diff} EUR`);
+    } else {
+      console.log(`[Buton] Yok — rivalAhead: ${alert.rivalAhead}, diff: ${diff}`);
     }
 
-    if (TELEGRAM_CHAT_ID) await telegramPost(TELEGRAM_CHAT_ID, body);
-    if (TELEGRAM_GROUP_ID) await telegramPost(TELEGRAM_GROUP_ID, { text });
+    await sendAlert(text, replyMarkup);
     await sleep(400);
   }
 
-  // ─── Özet + Pricer'ı Kapat ────────────────────────────────────────────────
+  // ─── Özet + Pricer'ı Kapat butonu ────────────────────────────────────────
   const ts = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
   if (allAlerts.length === 0) {
-    if (TELEGRAM_CHAT_ID) await telegramPost(TELEGRAM_CHAT_ID, {
-      text: `✅ <b>Monitor tamamlandı</b>\nDeğişiklik yok.\n🕐 ${ts}`,
-    });
+    await sendAlert(`✅ <b>Monitor tamamlandı</b>\nDeğişiklik yok.\n🕐 ${ts}`, null);
     console.log('Değişiklik yok.');
   } else {
-    if (TELEGRAM_CHAT_ID) await telegramPost(TELEGRAM_CHAT_ID, {
-      text: `📊 <b>Monitor tamamlandı</b>\n${allAlerts.length} uyarı gönderildi.\nPricer başlatıldı.\n🕐 ${ts}`,
-      reply_markup: {
-        inline_keyboard: [[{ text: '🛑 Pricer\'ı Kapat', callback_data: 'shutdown_pricer' }]],
-      },
-    });
+    const shutdownMarkup = {
+      inline_keyboard: [[{ text: '🛑 Pricer\'ı Kapat', callback_data: 'shutdown_pricer' }]],
+    };
+    await sendAlert(
+      `📊 <b>Monitor tamamlandı</b>\n${allAlerts.length} uyarı gönderildi.\nPricer başlatıldı.\n🕐 ${ts}`,
+      shutdownMarkup
+    );
   }
 
   // ─── Pricer spawn ─────────────────────────────────────────────────────────
