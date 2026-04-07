@@ -32,12 +32,11 @@ const PARTNER_USER       = process.env.PARTNER_USER;
 const PARTNER_PASS       = process.env.PARTNER_PASS;
 
 const PASS_URL       = 'https://pass1.bibliki.ru';
-const BIBLIO_BASE    = 'https://www.bgoperator.ru';
 const PARTNER_BASE   = 'https://partner.bgoperator.ru';
 const PARTNER_PRTN   = '115810428452';
 const PASS_WAIT_MS   = 5 * 60 * 1000;
 
-const CLICKED_FILE = 'clicked_buttons.json'; // Basılmış butonlar
+const CLICKED_FILE = 'clicked_buttons.json';
 const AGENCY_RULES = [
   { pattern: '103810219', name: 'PENINSULA' },
   { pattern: '103816',    name: 'AKAY(FIT)' },
@@ -103,14 +102,12 @@ async function tgRequest(method, body) {
 }
 
 async function sendMsg(text, extra = {}) {
-  // Bot'a gönder
   await tgRequest('sendMessage', {
     chat_id:    TELEGRAM_CHAT_ID,
     text,
     parse_mode: 'HTML',
     ...extra,
   });
-  // Group'a da gönder (buton olmadan)
   if (TELEGRAM_GROUP_ID) {
     await tgRequest('sendMessage', {
       chat_id:    TELEGRAM_GROUP_ID,
@@ -145,16 +142,20 @@ async function doPass(browser) {
     return;
   }
   console.log('[Pass] pass1.bibliki.ru açılıyor...');
+  await sendMsg('🔐 <b>[1/3] Pass başlatıldı</b>\npass1.bibliki.ru açılıyor...');
   const page = await browser.newPage();
   await page.authenticate({ username: PARTNER_USER, password: PARTNER_PASS });
   try {
     await page.goto(PASS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     console.log('[Pass] Açıldı. 5 dakika bekleniyor (IP whitelist)...');
+    await sendMsg('⏳ <b>[1/3] Pass açıldı</b>\n5 dakika IP whitelist bekleniyor...');
     await sleep(PASS_WAIT_MS);
     console.log('[Pass] Bekleme tamamlandı.');
+    await sendMsg('✅ <b>[1/3] Pass tamamlandı</b>');
     passCompleted = true;
   } catch(e) {
     console.warn('[Pass] Hata (devam):', e.message);
+    await sendMsg(`⚠️ <b>[1/3] Pass hatası</b>\n${e.message}`);
   } finally {
     await page.close();
   }
@@ -163,7 +164,10 @@ async function doPass(browser) {
 // ─── 2. Partner login ─────────────────────────────────────────────────────────
 async function partnerLogin(browser) {
   console.log('[Partner] Giriş yapılıyor...');
+  await sendMsg('🔑 <b>[2/3] Partner login başlatıldı</b>\npartner.bgoperator.ru açılıyor...');
   const page = await browser.newPage();
+  // Partner sitesi de HTTP Basic Auth istiyor — pass ile aynı credentials
+  await page.authenticate({ username: PARTNER_USER, password: PARTNER_PASS });
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1366, height: 900 });
   await page.goto(`${PARTNER_BASE}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -172,6 +176,7 @@ async function partnerLogin(browser) {
   const loginInput = await page.$('input[name="login"]');
   if (!loginInput) {
     console.log('[Partner] Zaten giriş yapılmış.');
+    await sendMsg('✅ <b>[2/3] Partner: Zaten giriş yapılmış</b>\nTelegram callback bekleniyor...');
     return page;
   }
   await page.type('input[name="login"]',    PARTNER_USER, { delay: 60 });
@@ -182,20 +187,19 @@ async function partnerLogin(browser) {
   ]);
   await sleep(1500);
   console.log('[Partner] Giriş tamam.');
+  await sendMsg('✅ <b>[2/3] Partner login tamam</b>\nTelegram callback bekleniyor...');
   return page;
 }
 
 // ─── 3. Otel sayfasını aç + PP fiyatını çek ──────────────────────────────────
-// Partner sitesinde otel sayfasına gidip "Viewing of the prices" → Final price çek
-// dateShift: bugün ile kontrat başlangıcı arasındaki fark için +10 gün dene
 async function fetchPpFromPartner(partnerPage, hotelName, checkIn) {
   console.log(`[PP] ${hotelName} - ${checkIn} için partner PP çekiliyor...`);
+  await sendMsg(`🔍 <b>[3a] PP fiyatı çekiliyor</b>\n🏨 ${hotelName}\n📅 ${checkIn}`);
 
   const searchUrl = `${PARTNER_BASE}/accomodation?task=hotels&pCountryId=100411293179&prtn=${PARTNER_PRTN}`;
   await partnerPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
 
-  // Otel adının ilk iki kelimesini yaz (yeterli)
   const searchWords = hotelName.split(/\s+/).slice(0, 2).join(' ');
   console.log(`[PP] Arama: "${searchWords}"`);
 
@@ -207,10 +211,8 @@ async function fetchPpFromPartner(partnerPage, hotelName, checkIn) {
   await partnerPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
   await sleep(2000);
 
-  // İlk otel linkine tıkla (task=hotels ve hotelId içeren)
   const hotelLink = await partnerPage.$('a[href*="task=hotels"][href*="hotelId="]');
   if (!hotelLink) {
-    // Fallback: herhangi bir otel linki
     const anyLink = await partnerPage.$('a[href*="hotelId="]');
     if (!anyLink) throw new Error(`Otel bulunamadı: ${hotelName}`);
     await anyLink.click();
@@ -220,9 +222,6 @@ async function fetchPpFromPartner(partnerPage, hotelName, checkIn) {
   await partnerPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
   await sleep(2000);
 
-  // Odaların listesinden ilk odayı aç (STANDARD ROOM veya benzeri)
-  // Her oda için "Final price" linkine tıkla
-  // İlk odanın Final price linkini bul
   const finalPriceLink = await partnerPage.$('a[href*="task=ns"]');
   if (!finalPriceLink) {
     console.warn('[PP] Final price linki bulunamadı, sayfada oda yok.');
@@ -233,13 +232,9 @@ async function fetchPpFromPartner(partnerPage, hotelName, checkIn) {
   await partnerPage.goto(finalPriceHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(1500);
 
-  // "Viewing of the prices" formunu doldur:
-  // Validity period from: checkIn + 10 gün (dateshift)
-  // till: checkIn + 24 gün
-  // Show butonuna bas
   const [d, m, y] = checkIn.split('.').map(Number);
   const fromDate  = new Date(y, m - 1, d);
-  fromDate.setDate(fromDate.getDate() + 10); // +10 gün dateshift
+  fromDate.setDate(fromDate.getDate() + 10);
   const tillDate  = new Date(fromDate);
   tillDate.setDate(tillDate.getDate() + 14);
 
@@ -248,22 +243,14 @@ async function fetchPpFromPartner(partnerPage, hotelName, checkIn) {
 
   console.log(`[PP] Validity: ${fromStr} - ${tillStr}`);
 
-  // Tarihleri input'lara yaz
   await partnerPage.evaluate((from, till) => {
     const pBeg = document.querySelector('#pBeg') || document.querySelector('input[name="pBeg"]');
     const pEnd = document.querySelector('#pEnd') || document.querySelector('input[name="pEnd"]');
-    if (pBeg) {
-      pBeg.value = from;
-      pBeg.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    if (pEnd) {
-      pEnd.value = till;
-      pEnd.dispatchEvent(new Event('change', { bubbles: true }));
-    }
+    if (pBeg) { pBeg.value = from; pBeg.dispatchEvent(new Event('change', { bubbles: true })); }
+    if (pEnd) { pEnd.value = till; pEnd.dispatchEvent(new Event('change', { bubbles: true })); }
   }, fromStr, tillStr);
   await sleep(500);
 
-  // Show butonuna bas
   const showBtn = await partnerPage.$('#bShow') ||
                   await partnerPage.$('input[name="bShow"]') ||
                   await partnerPage.$('input[value="Show"]');
@@ -273,71 +260,48 @@ async function fetchPpFromPartner(partnerPage, hotelName, checkIn) {
     await sleep(2000);
   }
 
-  // Final price'dan PP hesapla
-  // font color="#339933" içinde "X.XX[12-99][12-99] EUR" formatı
-  // Veya font color="#909090" içinde title="...dp: X, X, X..." formatı
   const ppResult = await partnerPage.evaluate(() => {
-    // 1. Önce yeşil (Final price) fiyatı dene: font color="#339933"
     const greenFonts = document.querySelectorAll('font[color="#339933"]');
     for (const font of greenFonts) {
       const text  = font.textContent.trim();
-      // "320.00[12-99][12-99] EUR" → 320.00 çek
       const match = text.match(/^(\d+(?:\.\d+)?)\[/);
       if (match) {
         const totalPrice = parseFloat(match[1]);
-        // Bu "Price for 14 nights" DBL fiyatı
-        // PP/gece = totalPrice / 2 / 7
         return { ppPerNight: totalPrice / 2 / 7, source: 'green', raw: text };
       }
     }
-
-    // 2. Fallback: gri fiyat (font color="#909090") title içindeki dp değerleri
     const grayFonts = document.querySelectorAll('font[color="#909090"]');
     for (const font of grayFonts) {
-      const title    = font.getAttribute('title') || '';
-      const dpMatch  = title.match(/dp:\s*([\d.,\s]+)/);
+      const title   = font.getAttribute('title') || '';
+      const dpMatch = title.match(/dp:\s*([\d.,\s]+)/);
       if (dpMatch) {
-        const values = dpMatch[1]
-          .split(',')
-          .map(v => parseFloat(v.trim()))
-          .filter(v => !isNaN(v) && v > 0)
-          .slice(0, 7);
+        const values = dpMatch[1].split(',').map(v => parseFloat(v.trim())).filter(v => !isNaN(v) && v > 0).slice(0, 7);
         if (values.length > 0) {
           const avgNightly = values.reduce((s, v) => s + v, 0) / values.length;
           return { ppPerNight: avgNightly / 2, source: 'gray', raw: title.slice(0, 80) };
         }
       }
     }
-
     return null;
   });
 
   if (ppResult) {
     console.log(`[PP] PP/gece: ${ppResult.ppPerNight.toFixed(4)} EUR (kaynak: ${ppResult.source})`);
+    await sendMsg(`💰 <b>[3a] PP fiyatı bulundu</b>\nPP/gece: ${ppResult.ppPerNight.toFixed(4)} EUR (${ppResult.source})`);
   } else {
     console.warn('[PP] Fiyat çekilemedi — kontrat henüz açılmamış olabilir.');
+    await sendMsg('⚠️ <b>[3a] PP fiyatı çekilemedi</b>\nKontrat henüz açılmamış olabilir.');
   }
 
   return ppResult;
 }
 
 // ─── 4. % İndirim hesapla ────────────────────────────────────────────────────
-// ppPerNightEur: partner sitesinden okunan per person per night EUR fiyatı
-// peninsulaEUR: scraperın bulduğu paket EUR (bizim fiyatımız)
-// rivalEUR: scraperın bulduğu rakip paket EUR
-// Sistem 100 RUB minimum indirimi destekliyor.
-// Yaklaşık EUR/RUB kuru scraper analizinde kullanılmıyor burada,
-// PP fiyatı zaten EUR olarak geliyor partner sitesinden.
 function calcDiscount(ppPerNightEur, peninsulaEUR, rivalEUR) {
   if (!ppPerNightEur || ppPerNightEur <= 0) return null;
 
-  // 7 gecelik DBL toplam
-  const ourTotal7Night   = ppPerNightEur * 2 * 7;
-  // Rakip ile fark (paket bazında)
   const diffEur          = peninsulaEUR - rivalEUR;
-  // PP/gece bazında fark
   const ppNightDiff      = diffEur / 7 / 2;
-  // Hedef: rakibin 1 EUR/gece/PP altına geç
   const targetPpPerNight = ppPerNightEur - ppNightDiff - 1;
 
   if (targetPpPerNight <= 0) {
@@ -345,17 +309,14 @@ function calcDiscount(ppPerNightEur, peninsulaEUR, rivalEUR) {
     return null;
   }
 
-  // % discount (relative)
   const discountPct = (targetPpPerNight / ppPerNightEur) * 100;
 
   console.log(`[Hesap] PP/gece: ${ppPerNightEur.toFixed(4)} EUR | Fark: ${diffEur} EUR | Hedef: ${targetPpPerNight.toFixed(4)} EUR | İndirim: %${discountPct.toFixed(3)}`);
 
-  // Güvenlik: %85'in altına düşme
   if (discountPct < 85) {
     console.warn(`[Hesap] İndirim çok yüksek (%${discountPct.toFixed(3)}) — iptal.`);
     return null;
   }
-  // %100'ü geçemez
   if (discountPct >= 100) {
     console.warn('[Hesap] İndirim >= 100% — iptal.');
     return null;
@@ -368,6 +329,7 @@ function calcDiscount(ppPerNightEur, peninsulaEUR, rivalEUR) {
 async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
   const { from: validFrom, till: validTill } = getValidityRange(checkIn);
   console.log(`[MassInsert] ${hotelName} | ${validFrom}→${validTill} | %${discountPct.toFixed(3)}`);
+  await sendMsg(`⚙️ <b>[3b] Mass Insert başlatıldı</b>\n🏨 ${hotelName}\n📅 ${validFrom} → ${validTill}\n📉 İndirim: %${discountPct.toFixed(3)}`);
 
   const searchUrl = `${PARTNER_BASE}/accomodation?task=hotels&pCountryId=100411293179&prtn=${PARTNER_PRTN}`;
   await partnerPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -389,15 +351,14 @@ async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
   await partnerPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
   await sleep(2000);
 
-  // "Mass insert" linkine tıkla: href içinde "task=staypay" var
   const massLink = await partnerPage.$('a[href*="task=staypay"]');
   if (!massLink) throw new Error(`Mass insert linki bulunamadı: ${hotelName}`);
   await massLink.click();
   await partnerPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
   await sleep(2000);
   console.log('[MassInsert] Sayfa açıldı.');
+  await sendMsg('📄 <b>[3b] Mass Insert sayfası açıldı</b>\nSPO tipi seçiliyor...');
 
-  // SPO type seç: "Early booking on period (on percentage basis)"
   await partnerPage.waitForSelector('select[name="pIdSpec"]', { timeout: 15000 });
   const spoSelected = await partnerPage.evaluate(() => {
     const sel = document.querySelector('select[name="pIdSpec"]');
@@ -406,7 +367,6 @@ async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
       if (opt.text.includes('Early booking on period (on percentage basis)')) {
         sel.value = opt.value;
         sel.dispatchEvent(new Event('change', { bubbles: true }));
-        // form submit tetikle (onchange="javascript:submit()")
         if (sel.getAttribute('onchange') && sel.getAttribute('onchange').includes('submit')) {
           sel.form && sel.form.submit();
           return 'submit';
@@ -424,14 +384,13 @@ async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
     await sleep(1500);
   }
   console.log(`[MassInsert] SPO seçildi: ${spoSelected}`);
+  await sendMsg('✅ <b>[3b] SPO tipi seçildi</b>\nOdalar işaretleniyor...');
 
-  // % indirim gir
   await partnerPage.waitForSelector('input[name="pPercPrice"]', { timeout: 15000 });
   await partnerPage.click('input[name="pPercPrice"]', { clickCount: 3 });
   await partnerPage.type('input[name="pPercPrice"]', discountPct.toFixed(3), { delay: 50 });
   await sleep(300);
 
-  // Validity period: frmIPBeg / frmIPEnd
   await partnerPage.evaluate((from, till) => {
     const selectors = [
       ['#frmIPBeg', '#frmIPEnd'],
@@ -450,7 +409,6 @@ async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
   }, validFrom, validTill);
   await sleep(300);
 
-  // Disappearance date: "current date and time" checkbox'ını KALDIR
   await partnerPage.evaluate(() => {
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
     for (const cb of checkboxes) {
@@ -462,81 +420,48 @@ async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
   });
   await sleep(300);
 
-  // Odaları seç:
-  // Sütun 1 (oda tipi): tüm checkbox'lar → Select all
-  // Sütun 2 (kişi tipi: DBL, SGL, 1AD, 2AD vs.): tüm checkbox'lar → Select all
-  // Sütun 3 (board tipi: Base price, AI, vb.): SADECE Base price
   await partnerPage.evaluate(() => {
-    // Her oda bloğu için 3 sütunlu yapı:
-    // td.light[0] = oda listesi (STANDARD ROOM, Cost price, Base price, Final price)
-    // td.light[1] = kişi tipleri (DBL, SGL, 1AD, 3AD vs.)
-    // td.light[2] = board tipleri (Base price, AI)
-    // (bazen 3 değil 2 td olabilir — ikinci yaklaşım)
-
-    // Tüm "Select all" checkbox'larını bul
     const allCbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-
-    // Her checkbox için: hangi sütunda olduğunu belirle
     for (const cb of allCbs) {
-      // Üst td'yi bul
       const td = cb.closest('td');
       if (!td) continue;
-
-      // td'nin sütun indeksini bul
       const row  = td.closest('tr');
       if (!row) continue;
       const cols = Array.from(row.querySelectorAll('td'));
       const idx  = cols.indexOf(td);
-
-      // Sütun 0 ve 1: tüm checkbox → işaretle
-      // Sütun 2 (board): sadece Base price
       const labelEl = cb.closest('label');
       const labelText = (labelEl ? labelEl.textContent : (cb.nextSibling?.textContent || '')).trim();
-
-      // "Select all" ise
       if (labelText.toLowerCase().startsWith('select all')) {
         if (idx <= 1) {
           if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
         }
-        // Sütun 2 Select all: DOKUNMA
         continue;
       }
-
       if (idx === 2 || td.getAttribute('valign') === 'top' && cols.length <= 3 && idx === cols.length - 1) {
-        // Board sütunu — sadece Base price
         if (labelText.includes('Base price')) {
           if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
         } else {
           if (cb.checked) { cb.checked = false; cb.dispatchEvent(new Event('change', { bubbles: true })); }
         }
       } else if (idx === 0 || idx === 1) {
-        // Oda ve kişi sütunları
         if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
       }
     }
   });
   await sleep(500);
 
-  // Alternatif/düzeltici: pNsId ile başlayan checkbox'ları işaretle (oda seçimi)
-  // pProvider ile başlayanları işaretle (kişi seçimi)
-  // selectAllNS*, selectAllConnectedRecs checkbox'larını işaretle
   await partnerPage.evaluate(() => {
     const allCbs = document.querySelectorAll('input[type="checkbox"]');
     for (const cb of allCbs) {
       const name = cb.getAttribute('name') || '';
       const cls  = cb.getAttribute('class') || '';
-      // Oda seçimi: pNsId ile başlar
       if (name.startsWith('pNsId') || cls.startsWith('selectAllNS')) {
         if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
       }
-      // selectAllConnectedRecs: kişi tipleri
       if (name === 'selectAllConnectedRecs' || cls.includes('selectAllConnected')) {
         if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
       }
     }
-
-    // Sütun 3 (board): Board tiplerini yeniden kontrol et
-    // "AI" checkbox'larını bul ve kaldır
     const allLabels = document.querySelectorAll('label, td');
     for (const el of allLabels) {
       const text = el.textContent.trim();
@@ -552,13 +477,13 @@ async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
   });
   await sleep(500);
 
-  // Save butonuna bas
   const saveBtn = await partnerPage.$('input[value="Save"]') ||
                   await partnerPage.$('button[type="submit"]') ||
                   await partnerPage.$('input[type="submit"]');
   if (!saveBtn) throw new Error('Save butonu bulunamadı');
 
   console.log('[MassInsert] Save basılıyor...');
+  await sendMsg('💾 <b>[3b] Save basılıyor...</b>\nSayfa yüklenmesi bekleniyor...');
   await Promise.all([
     partnerPage.waitForNavigation({ waitUntil: 'networkidle0', timeout: 90000 }).catch(async () => {
       console.warn('[MassInsert] networkidle0 zaman aşımı, 8 sn bekleniyor...');
@@ -568,12 +493,14 @@ async function applyMassInsert(partnerPage, hotelName, checkIn, discountPct) {
   ]);
   await sleep(3000);
   console.log('[MassInsert] SPO kaydedildi.');
+  await sendMsg('✅ <b>[3b] SPO kaydedildi!</b>');
 }
 
 // ─── 6. Verify scrape: öne geçtik mi? ────────────────────────────────────────
 async function verifyScrape(hotelId, hotelName, checkIn, rivalEUR) {
   console.log(`[Verify] ${hotelName} - ${checkIn} kontrol ediliyor...`);
-  await sleep(5 * 60 * 1000); // 5 dk bekle
+  await sendMsg(`⏳ <b>[4] Sonuç kontrolü</b>\n5 dakika bekleniyor...\n🏨 ${hotelName}`);
+  await sleep(5 * 60 * 1000);
 
   const browser2 = await puppeteer.launch({
     headless: 'new',
@@ -640,21 +567,18 @@ async function processApproval(cbData, browser, partnerPage) {
   if (parts.length < 6) throw new Error(`Geçersiz format: ${cbData}`);
 
   const [, hotelId, hotelNameEnc, checkIn, peninsulaEurStr, rivalEurStr] = parts;
-  const hotelName   = decodeURIComponent(hotelNameEnc);
+  const hotelName    = decodeURIComponent(hotelNameEnc);
   const peninsulaEUR = parseInt(peninsulaEurStr, 10);
   const rivalEUR     = parseInt(rivalEurStr, 10);
 
   console.log(`[Approval] ${hotelName} | ${checkIn} | Peninsula: ${peninsulaEUR} EUR | Rakip: ${rivalEUR} EUR`);
 
-  // 1. PP fiyatını partner sitesinden çek
   const ppResult = await fetchPpFromPartner(partnerPage, hotelName, checkIn);
   if (!ppResult) throw new Error(`PP fiyatı bulunamadı: ${hotelName} (kontrat açılmamış olabilir)`);
 
-  // 2. % indirim hesapla
   const discountPct = calcDiscount(ppResult.ppPerNight, peninsulaEUR, rivalEUR);
   if (!discountPct) throw new Error('İndirim hesaplanamadı (güvenlik sınırı veya negatif değer)');
 
-  // 3. Mass insert uygula
   await applyMassInsert(partnerPage, hotelName, checkIn, discountPct);
 
   const { from: validFrom, till: validTill } = getValidityRange(checkIn);
@@ -688,7 +612,6 @@ async function main() {
 
   let partnerPage = null;
 
-  // Pass + login başlangıçta yap
   await doPass(browser);
   partnerPage = await partnerLogin(browser);
 
@@ -709,7 +632,6 @@ async function main() {
         const messageId = cb.message?.message_id;
         const cbData    = cb.data || '';
 
-        // Shutdown komutu
         if (cbData === 'shutdown_pricer') {
           await answerCb(cb.id, '🛑 Kapatılıyor...');
           await sendMsg('🛑 <b>Pricer kapatıldı.</b>');
@@ -718,37 +640,27 @@ async function main() {
           process.exit(0);
         }
 
-        // Yetki kontrolü
-     //    if (chatId !== String(TELEGRAM_CHAT_ID)) {
-     //      await answerCb(cb.id, '⛔ Yetkisiz');
-     //      continue;
-    //     }
-
         if (cbData.startsWith('skip__')) {
           await answerCb(cb.id, '⏭ Atlandı');
-          // Butonu deaktif et
           await editMsgReplyMarkup(chatId, messageId, { inline_keyboard: [[{ text: '⏭ Atlandı', callback_data: 'noop' }]] });
           continue;
         }
 
         if (!cbData.startsWith('approve__')) continue;
 
-        // Daha önce basıldı mı?
         if (isClicked(cbData)) {
           await answerCb(cb.id, '⚠️ Bu işlem zaten yapıldı.');
           continue;
         }
 
-        // Butonu hemen deaktif et (tekrar basılmasın)
         markClicked(cbData);
         await editMsgReplyMarkup(chatId, messageId, {
           inline_keyboard: [[{ text: '⏳ İşleniyor...', callback_data: 'noop' }]],
         });
         await answerCb(cb.id, '⏳ İşleniyor...');
-        await sendMsg('⏳ Fiyat güncelleniyor, lütfen bekleyin...');
+        await sendMsg('⏳ <b>Fiyat güncelleniyor...</b>\nAdımlar Telegram\'a bildirilecek.');
 
         try {
-          // Partner sayfası kapandıysa yeniden aç
           if (!partnerPage || partnerPage.isClosed()) {
             partnerPage = await partnerLogin(browser);
           }
@@ -766,12 +678,10 @@ async function main() {
             `⏳ 5 dakika sonra sonuç kontrol ediliyor...`
           );
 
-          // Butonu "Tamamlandı" olarak güncelle
           await editMsgReplyMarkup(chatId, messageId, {
             inline_keyboard: [[{ text: '✅ Tamamlandı', callback_data: 'noop' }]],
           });
 
-          // 5 dk bekle + verify scrape
           const verifyResult = await verifyScrape(
             result.hotelId,
             result.hotelName,
@@ -803,7 +713,6 @@ async function main() {
           await editMsgReplyMarkup(chatId, messageId, {
             inline_keyboard: [[{ text: '❌ Hata — Tekrar Dene', callback_data: cbData }]],
           });
-          // Clicked kaydını sil (tekrar denenebilsin)
           const clicked = loadClicked();
           delete clicked[cbData];
           saveClicked(clicked);
