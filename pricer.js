@@ -719,10 +719,10 @@ async function main() {
         }
 
         // Yetki kontrolü
-        if (chatId !== String(TELEGRAM_CHAT_ID)) {
-          await answerCb(cb.id, '⛔ Yetkisiz');
-          continue;
-        }
+     //    if (chatId !== String(TELEGRAM_CHAT_ID)) {
+     //      await answerCb(cb.id, '⛔ Yetkisiz');
+     //      continue;
+    //     }
 
         if (cbData.startsWith('skip__')) {
           await answerCb(cb.id, '⏭ Atlandı');
