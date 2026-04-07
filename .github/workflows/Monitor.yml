@@ -1,0 +1,51 @@
+name: Peninsula Price Monitor
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: State cache yükle
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            price_state.json
+            clicked_buttons.json
+          key: price-state-${{ github.run_id }}
+          restore-keys: |
+            price-state-
+
+      - name: Node.js kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Bağımlılıkları yükle
+        run: npm install puppeteer
+
+      - name: Chrome kur
+        run: npx puppeteer browsers install chrome
+
+      - name: Monitor çalıştır
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.CHAT_ID }}
+          GROUP_CHAT_ID:      ${{ secrets.GROUP_CHAT_ID }}
+        run: node monitor.js
+
+      - name: State cache kaydet
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            price_state.json
+            clicked_buttons.json
+          key: price-state-${{ github.run_id }}-${{ github.run_attempt }}
