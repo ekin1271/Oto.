@@ -1,23 +1,22 @@
 /**
- * scraper.js
+ * monitor.js
  * BGOperator fiyat tarama + rakip karşılaştırma + Telegram bildirimi
- * Bildirimde "Öne Geç" butonu → pricer.js handle eder
+ * Tamamlanınca pricer.js'i spawn eder (ayrı process).
  *
  * ENV: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROUP_CHAT_ID (opsiyonel)
  */
 
 const puppeteer = require('puppeteer');
-const fs = require('fs');
-const https = require('https');
+const fs        = require('fs');
+const https     = require('https');
+const { spawn } = require('child_process');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const TELEGRAM_GROUP_ID  = process.env.GROUP_CHAT_ID;
 const STATE_FILE         = 'price_state.json';
 const HOTELS_FILE        = 'hotels.json';
-const RULES_FILE         = 'price_rules.json';
 
-// Ajans pattern → isim eşleştirmesi
 const AGENCY_RULES = [
   { pattern: '103810219', name: 'PENINSULA' },
   { pattern: '103816',    name: 'AKAY(FIT)' },
@@ -32,26 +31,14 @@ function loadHotels() {
   return [];
 }
 
-function loadRules() {
-  if (fs.existsSync(RULES_FILE)) return JSON.parse(fs.readFileSync(RULES_FILE, 'utf8'));
-  return { _default: { maxDiff: 5 } };
-}
-
-function getRule(hotelId) {
-  const rules = loadRules();
-  return rules[String(hotelId)] || rules['_default'] || { maxDiff: 5 };
-}
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Önümüzdeki 4 ay için check-in tarihleri üret
 function generateDates() {
   const dates = [];
   const now = new Date();
   const firstDate = new Date(now);
   firstDate.setDate(firstDate.getDate() + 5);
 
-  // Mart sonu → Nisan 15'e atla
   if (firstDate.getMonth() === 2) {
     firstDate.setMonth(3);
     firstDate.setDate(15);
@@ -61,10 +48,9 @@ function generateDates() {
     const d = m === 0
       ? new Date(firstDate)
       : new Date(firstDate.getFullYear(), firstDate.getMonth() + m, 15);
-
-    const fmt = n => String(n).padStart(2, '0');
-    const checkIn  = `${fmt(d.getDate())}.${fmt(d.getMonth()+1)}.${d.getFullYear()}`;
-    const out = new Date(d);
+    const fmt     = n => String(n).padStart(2, '0');
+    const checkIn = `${fmt(d.getDate())}.${fmt(d.getMonth()+1)}.${d.getFullYear()}`;
+    const out     = new Date(d);
     out.setDate(out.getDate() + 7);
     const checkOut = `${fmt(out.getDate())}.${fmt(out.getMonth()+1)}.${out.getFullYear()}`;
     dates.push({ checkIn, checkOut });
@@ -89,24 +75,26 @@ function generateUrls(hotels) {
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
 function telegramPost(chatId, body) {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify({ chat_id: chatId, parse_mode: 'HTML', disable_web_page_preview: true, ...body });
-    const req  = https.request(
+  return new Promise((resolve) => {
+    const data = JSON.stringify({
+      chat_id: chatId,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...body,
+    });
+    const req = https.request(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
       { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } },
       res => { res.resume(); res.on('end', resolve); }
     );
-    req.on('error', reject);
+    req.on('error', e => { console.error('Telegram error:', e.message); resolve(); });
     req.write(data);
     req.end();
   });
 }
 
 async function sendAlert(alert) {
-  const rule = getRule(alert.hotelId);
   const diff = alert.rivalAhead ? (alert.peninsulaPrice - alert.cheapestPrice) : 0;
-  // Butonu her zaman göster — limit/sınır yok, kullanıcı karar verir
-  const canAutoPrice = alert.rivalAhead && diff > 0 && diff <= rule.maxDiff;
 
   let text = `🏨 <b>${alert.hotel}</b>\n🛏 ${alert.room}\n📅 ${alert.checkIn}\n`;
 
@@ -119,31 +107,29 @@ async function sendAlert(alert) {
   } else {
     text += `🆕 Rakip girdi — biz öndeyiz\n📌 Peninsula: ${alert.peninsulaPrice} EUR\n🏆 ${alert.cheapestAgency}: ${alert.cheapestPrice} EUR`;
   }
-
   text += `\n🕐 ${new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' })}`;
 
   const mainBody = { text };
 
-  // Öne geç butonu — sadece rakip önde ve fark kural içindeyse
-  if (canAutoPrice) {
+  // Öne geç butonu — rakip önde olduğunda her zaman göster
+  if (alert.rivalAhead && diff > 0) {
     // callback_data: approve__hotelId__hotelName__checkIn__peninsulaEUR__rivalEUR
     mainBody.reply_markup = {
       inline_keyboard: [[
         {
-          text: `✅ Öne Geç (→ ${alert.cheapestPrice - 2} EUR)`,
-          callback_data: `approve__${alert.hotelId}__${alert.hotel}__${alert.checkIn}__${alert.peninsulaPrice}__${alert.cheapestPrice}`,
+          text: `✅ Öne Geç (Fark: ${diff} EUR)`,
+          callback_data: `approve__${alert.hotelId}__${encodeURIComponent(alert.hotel)}__${alert.checkIn}__${alert.peninsulaPrice}__${alert.cheapestPrice}`,
         },
         { text: '❌ Geç', callback_data: `skip__${alert.hotelId}__${alert.checkIn}` },
       ]],
     };
   }
 
-  await telegramPost(TELEGRAM_CHAT_ID, mainBody);
+  // Bot'a gönder (butonlu)
+  if (TELEGRAM_CHAT_ID) await telegramPost(TELEGRAM_CHAT_ID, mainBody);
 
-  // Group'a butonsuz gönder
-  if (TELEGRAM_GROUP_ID) {
-    await telegramPost(TELEGRAM_GROUP_ID, { text });
-  }
+  // Group'a butonSUZ gönder
+  if (TELEGRAM_GROUP_ID) await telegramPost(TELEGRAM_GROUP_ID, { text });
 }
 
 // ─── Scrape ──────────────────────────────────────────────────────────────────
@@ -180,19 +166,24 @@ async function scrapePageOnce(browser, targetUrl, checkIn, hotelId) {
         if (nameDiv) hotelName = nameDiv.textContent.trim();
       }
 
+      // Tüm tr'leri dolaş — collapsed/hidden olanlar dahil
       const allRows = block.querySelectorAll('tr');
-      let peninsulaPrice = null;
+      let peninsulaPrice    = null;
       let peninsulaRoomName = '';
-      const rivals = [];
+      const rivals          = [];
 
       for (const tr of allRows) {
+        // Visibility kontrolü kaldırıldı — display:none olanlar dahil
         const allLis = tr.querySelectorAll('li.s8.i_t1');
         if (allLis.length === 0) continue;
 
         let chosenLi = allLis[0];
         if (targetDate) {
           for (const li of allLis) {
-            if ((li.getAttribute('urr') || '').includes(targetDate)) { chosenLi = li; break; }
+            if ((li.getAttribute('urr') || '').includes(targetDate)) {
+              chosenLi = li;
+              break;
+            }
           }
         }
 
@@ -200,6 +191,7 @@ async function scrapePageOnce(browser, targetUrl, checkIn, hotelId) {
         const agency = identifyAgency(urr);
         if (!agency) continue;
 
+        // EUR fiyatı: href içindeki x= parametresi
         let price = null;
         const priceLink = tr.querySelector('td.c_pe a[href]');
         if (priceLink) {
@@ -235,7 +227,6 @@ async function scrapePageWithDateShift(browser, targetUrl, checkIn, hotelId) {
   let results = await scrapePageOnce(browser, targetUrl, checkIn, hotelId);
   if (results.length > 0) return { results, usedCheckIn: checkIn };
 
-  // Sonuç yoksa 5 gün ileri kaydır
   const [d, m, y] = checkIn.split('.');
   const date = new Date(y, m - 1, d);
   date.setDate(date.getDate() + 5);
@@ -280,7 +271,6 @@ function analyzeOffers(checkIn, offers, prevState, newState) {
       rivalAhead,
     };
 
-    // Sadece durum değiştiğinde veya yeni bir rakip girdiğinde bildir
     if (isNew && rivalAhead) {
       alerts.push({ ...base, type: 'ahead', diff: o.peninsulaPrice - cheapest.price, newRival: true });
     } else if (isNew && isEqual) {
@@ -308,14 +298,14 @@ function saveState(state) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log('=== Tarama başlıyor ===');
+  console.log('=== Monitor başlıyor ===');
   const hotels = loadHotels();
   const dates  = generateDates();
   console.log(`Otel: ${hotels.length} | Tarihler: ${dates.map(d => d.checkIn).join(', ')}`);
 
-  const prevState  = loadState();
-  const newState   = { ...prevState };
-  const allAlerts  = [];
+  const prevState = loadState();
+  const newState  = { ...prevState };
+  const allAlerts = [];
 
   const browser = await puppeteer.launch({
     headless: 'new',
@@ -362,32 +352,51 @@ async function main() {
   saveState(newState);
   console.log(`State kaydedildi. ${allAlerts.length} uyarı.`);
 
+  // Uyarıları gönder
   for (const alert of allAlerts) {
     await sendAlert(alert);
-    await sleep(300); // Telegram rate limit
+    await sleep(400);
   }
 
   if (allAlerts.length === 0) {
     console.log('Değişiklik yok.');
+    if (TELEGRAM_CHAT_ID) {
+      await telegramPost(TELEGRAM_CHAT_ID, {
+        text: `✅ <b>Monitor tamamlandı</b>\nDeğişiklik yok.\n🕐 ${new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' })}`,
+      });
+    }
+  } else {
+    // "Pricer'ı Kapat" butonu — analysis sonunda
+    if (TELEGRAM_CHAT_ID) {
+      await telegramPost(TELEGRAM_CHAT_ID, {
+        text: `📊 <b>Monitor tamamlandı</b>\n${allAlerts.length} uyarı gönderildi.\n\nPricer başlatıldı. Tüm işlemler bittiğinde kapatabilirsiniz.`,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🛑 Pricer\'ı Kapat', callback_data: 'shutdown_pricer' },
+          ]],
+        },
+      });
+    }
   }
+
+  // Pricer'ı spawn et (ayrı process)
+  console.log('=== Pricer başlatılıyor ===');
+  const pricer = spawn('node', ['pricer.js'], {
+    stdio: 'inherit',
+    env: process.env,
+    detached: false,
+  });
+
+  pricer.on('error', err => console.error('Pricer spawn hatası:', err.message));
+  pricer.on('exit', code => console.log(`Pricer çıktı: ${code}`));
 }
 
 main().catch(async err => {
   console.error('Kritik hata:', err.message);
-  // Telegram'a hata bildirimi gönder
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    const data = JSON.stringify({
-      chat_id:    TELEGRAM_CHAT_ID,
-      text:       `❌ <b>Scraper Hatası</b>\n\n${err.message}`,
-      parse_mode: 'HTML',
-    });
-    const req = https.request(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } },
-      res => res.resume()
-    );
-    req.write(data);
-    req.end();
+    await telegramPost(TELEGRAM_CHAT_ID, {
+      text: `❌ <b>Monitor Hatası</b>\n\n${err.message}`,
+    }).catch(() => {});
   }
   process.exit(1);
 });
