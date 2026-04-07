@@ -1,6 +1,7 @@
 /**
  * monitor.js
  * BGOperator fiyat tarama + rakip karşılaştırma + Telegram bildirimi
+ * Tamamlanınca pricer.js'i spawn eder (ayrı process).
  *
  * ENV: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROUP_CHAT_ID (opsiyonel)
  */
@@ -8,6 +9,7 @@
 const puppeteer = require('puppeteer');
 const fs        = require('fs');
 const https     = require('https');
+const { spawn } = require('child_process');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
@@ -109,7 +111,9 @@ async function sendAlert(alert) {
 
   const mainBody = { text };
 
+  // Öne geç butonu — rakip önde olduğunda her zaman göster
   if (alert.rivalAhead && diff > 0) {
+    // callback_data: approve__hotelId__hotelName__checkIn__peninsulaEUR__rivalEUR
     mainBody.reply_markup = {
       inline_keyboard: [[
         {
@@ -121,7 +125,10 @@ async function sendAlert(alert) {
     };
   }
 
+  // Bot'a gönder (butonlu)
   if (TELEGRAM_CHAT_ID) await telegramPost(TELEGRAM_CHAT_ID, mainBody);
+
+  // Group'a butonSUZ gönder
   if (TELEGRAM_GROUP_ID) await telegramPost(TELEGRAM_GROUP_ID, { text });
 }
 
@@ -159,12 +166,14 @@ async function scrapePageOnce(browser, targetUrl, checkIn, hotelId) {
         if (nameDiv) hotelName = nameDiv.textContent.trim();
       }
 
+      // Tüm tr'leri dolaş — collapsed/hidden olanlar dahil
       const allRows = block.querySelectorAll('tr');
       let peninsulaPrice    = null;
       let peninsulaRoomName = '';
       const rivals          = [];
 
       for (const tr of allRows) {
+        // Visibility kontrolü kaldırıldı — display:none olanlar dahil
         const allLis = tr.querySelectorAll('li.s8.i_t1');
         if (allLis.length === 0) continue;
 
@@ -182,6 +191,7 @@ async function scrapePageOnce(browser, targetUrl, checkIn, hotelId) {
         const agency = identifyAgency(urr);
         if (!agency) continue;
 
+        // EUR fiyatı: href içindeki x= parametresi
         let price = null;
         const priceLink = tr.querySelector('td.c_pe a[href]');
         if (priceLink) {
@@ -342,6 +352,7 @@ async function main() {
   saveState(newState);
   console.log(`State kaydedildi. ${allAlerts.length} uyarı.`);
 
+  // Uyarıları gönder
   for (const alert of allAlerts) {
     await sendAlert(alert);
     await sleep(400);
@@ -355,12 +366,29 @@ async function main() {
       });
     }
   } else {
+    // "Pricer'ı Kapat" butonu — analysis sonunda
     if (TELEGRAM_CHAT_ID) {
       await telegramPost(TELEGRAM_CHAT_ID, {
-        text: `📊 <b>Monitor tamamlandı</b>\n${allAlerts.length} uyarı gönderildi.\n\n⚠️ Pricer'ı başlatmak için GitHub Actions → Pricer Bot → Run workflow.`,
+        text: `📊 <b>Monitor tamamlandı</b>\n${allAlerts.length} uyarı gönderildi.\n\nPricer başlatıldı. Tüm işlemler bittiğinde kapatabilirsiniz.`,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🛑 Pricer\'ı Kapat', callback_data: 'shutdown_pricer' },
+          ]],
+        },
       });
     }
   }
+
+  // Pricer'ı spawn et (ayrı process)
+  console.log('=== Pricer başlatılıyor ===');
+  const pricer = spawn('node', ['pricer.js'], {
+    stdio: 'inherit',
+    env: process.env,
+    detached: false,
+  });
+
+  pricer.on('error', err => console.error('Pricer spawn hatası:', err.message));
+  pricer.on('exit', code => console.log(`Pricer çıktı: ${code}`));
 }
 
 main().catch(async err => {
