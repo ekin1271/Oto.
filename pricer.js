@@ -1,10 +1,5 @@
 /**
- * pricer.js  v4
- *
- * DÜZELTMELER v3'e göre:
- * - partnerLogin: page.authenticate() doğru yerde, her yeni sekme için çağrılıyor
- * - fetchPpPrice ve applyMassInsert aynı partnerPage'i kullanıyor, auth kaybolmuyor
- * - Kur: https://api.exchangerate-api.com/v4/latest/EUR (ücretsiz, kayıtsız)
+ * pricer.js  v4 + debug
  */
 
 const puppeteer = require('puppeteer');
@@ -48,7 +43,6 @@ function unmarkClicked(cb){ const d = loadJson(CLICKED_FILE); delete d[cb]; save
 function loadState() { return loadJson(STATE_FILE); }
 function markPriced(hotel, checkIn) {
   const st  = loadState();
-  // key oda tipini bilmiyoruz burada; tüm eşleşen key'leri güncelle
   for (const key of Object.keys(st)) {
     if (key.startsWith(`${checkIn}__${hotel}`)) st[key] = 'priced';
   }
@@ -80,6 +74,63 @@ async function answerCb(id, text)            { return tgReq('answerCallbackQuery
 async function editMarkup(chatId, msgId, mk) { return tgReq('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: mk }); }
 async function getUpdates(offset)            { return tgReq('getUpdates', { offset, timeout: 30, allowed_updates: ['callback_query'] }); }
 
+// ─── Screenshot → Telegram ────────────────────────────────────────────────────
+async function sendScreenshot(page, caption) {
+  try {
+    const buf = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 80 });
+    await new Promise(resolve => {
+      const boundary = 'BOUNDARY123';
+      const CRLF = '\r\n';
+      const header =
+        `--${boundary}${CRLF}` +
+        `Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}` +
+        `${TELEGRAM_CHAT_ID}${CRLF}` +
+        `--${boundary}${CRLF}` +
+        `Content-Disposition: form-data; name="caption"${CRLF}${CRLF}` +
+        `${caption}${CRLF}` +
+        `--${boundary}${CRLF}` +
+        `Content-Disposition: form-data; name="photo"; filename="screen.jpg"${CRLF}` +
+        `Content-Type: image/jpeg${CRLF}${CRLF}`;
+      const footer = `${CRLF}--${boundary}--${CRLF}`;
+
+      const headerBuf = Buffer.from(header, 'utf8');
+      const footerBuf = Buffer.from(footer, 'utf8');
+      const total     = headerBuf.length + buf.length + footerBuf.length;
+
+      const req = https.request(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': `multipart/form-data; boundary=${boundary}`,
+            'Content-Length': total,
+          },
+        },
+        res => { res.on('data', () => {}); res.on('end', resolve); }
+      );
+      req.on('error', resolve);
+      req.write(headerBuf);
+      req.write(buf);
+      req.write(footerBuf);
+      req.end();
+    });
+  } catch (e) {
+    console.warn('[Screenshot] Gönderilemedi:', e.message);
+  }
+}
+
+// HTML'in ilk N karakterini Telegram'a gönder (debug)
+async function sendHtmlDebug(page, label) {
+  try {
+    const url  = page.url();
+    const html = await page.content();
+    const chunk = html.substring(0, 2500);
+    await sendMsg(`🔍 <b>${label}</b>\nURL: <code>${url}</code>\n\n<pre>${chunk.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`);
+  } catch (e) {
+    console.warn('[HtmlDebug] Gönderilemedi:', e.message);
+  }
+}
+
 // ─── EUR kuru ─────────────────────────────────────────────────────────────────
 async function fetchEurRate() {
   return new Promise(resolve => {
@@ -103,7 +154,6 @@ async function doPass(browser) {
   await sendMsg('🔑 [1/3] Pass başlatıldı\npass1.bibliki.ru açılıyor...');
 
   const page = await browser.newPage();
-  // Pass sayfası HTTP Basic Auth gerektiriyor
   await page.authenticate({ username: PARTNER_USER, password: PARTNER_PASS });
 
   try {
@@ -123,18 +173,12 @@ async function doPass(browser) {
 }
 
 // ─── 2. Partner login ─────────────────────────────────────────────────────────
-// Her çağrıda yeni sekme açılır ve authenticate() set edilir.
-// Bu sayfa fetchPpPrice ve applyMassInsert için de kullanılır —
-// aynı sekme kaldığı sürece auth geçerlidir.
 async function partnerLogin(browser) {
   console.log('[Partner] Giriş yapılıyor...');
   await sendMsg('🔐 [2/3] Partner login başlatıldı\npartner.bgoperator.ru açılıyor...');
 
   const page = await browser.newPage();
-
-  // ÖNEMLİ: authenticate burada set ediliyor; sonraki tüm goto'larda geçerli
   await page.authenticate({ username: PARTNER_USER, password: PARTNER_PASS });
-
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1366, height: 900 });
 
@@ -219,6 +263,7 @@ async function fetchPpPrice(partnerPage, hotelName, checkIn) {
   console.log(`[PP] ${hotelName} → arama: "${searchStr}" | ${checkIn}`);
   await sendMsg(`⏳ [3a] PP fiyatı çekiliyor\n${hotelName}\nArama: "${searchStr}" | ${checkIn}`);
 
+  // ── Otel arama ──
   const searchUrl = `${PARTNER_BASE}/accomodation?task=hotels&pCountryId=100411293179&prtn=${PARTNER_PRTN}`;
   await partnerPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
@@ -231,6 +276,9 @@ async function fetchPpPrice(partnerPage, hotelName, checkIn) {
   await partnerPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
   await sleep(2000);
 
+  // DEBUG: Arama sonucu screenshot
+  await sendScreenshot(partnerPage, `🔍 Arama sonucu: "${searchStr}"`);
+
   const hotelLink = await partnerPage.$('a[href*="task=hotels"][href*="hotelId="]')
                  || await partnerPage.$('a[href*="hotelId="]');
   if (!hotelLink) throw new Error(`Otel linki bulunamadı: ${hotelName}`);
@@ -238,12 +286,23 @@ async function fetchPpPrice(partnerPage, hotelName, checkIn) {
   await partnerPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
   await sleep(2000);
 
+  // DEBUG: Otel sayfası screenshot
+  await sendScreenshot(partnerPage, `🏨 Otel sayfası: ${hotelName}`);
+
   const nsLink = await partnerPage.$('a[href*="task=ns"]');
-  if (!nsLink) throw new Error(`Final price linki yok: ${hotelName}`);
+  if (!nsLink) {
+    await sendHtmlDebug(partnerPage, 'NS linki YOK — sayfa HTML');
+    throw new Error(`Final price linki yok: ${hotelName}`);
+  }
   const nsHref = await partnerPage.evaluate(el => el.href, nsLink);
   await partnerPage.goto(nsHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
 
+  // DEBUG: NS sayfası açıldı — hem screenshot hem HTML
+  await sendScreenshot(partnerPage, `📄 NS sayfası açıldı: ${hotelName}`);
+  await sendHtmlDebug(partnerPage, `NS sayfası HTML — ${hotelName}`);
+
+  // ── Tarih ayarla ──
   const [d, m, y] = checkIn.split('.').map(Number);
   const from = new Date(y, m-1, d); from.setDate(from.getDate() + 10);
   const till = new Date(from);      till.setDate(till.getDate() + 14);
@@ -267,17 +326,40 @@ async function fetchPpPrice(partnerPage, hotelName, checkIn) {
   }, fromStr, tillStr);
   await sleep(500);
 
-  const showBtn = await partnerPage.$('input[value="Show"]')
-               || await partnerPage.$('#bShow')
-               || await partnerPage.$('input[name="bShow"]');
+  // DEBUG: Sayfadaki tüm input ve butonları logla
+  const allInputs = await partnerPage.evaluate(() =>
+    [...document.querySelectorAll('input, button')].map(el => ({
+      tag: el.tagName, type: el.type, name: el.name, id: el.id,
+      value: el.value, class: el.className
+    }))
+  );
+  console.log('[PP] Tüm input/butonlar:', JSON.stringify(allInputs));
+  await sendMsg(`🔧 Input listesi:\n<pre>${JSON.stringify(allInputs, null, 2).substring(0, 2000)}</pre>`);
+
+  // ── Show butonu — genişletilmiş arama ──
+  const showBtn =
+    await partnerPage.$('input[value="Show"]')            ||
+    await partnerPage.$('input[value="Показать"]')        ||
+    await partnerPage.$('input[value="show"]')            ||
+    await partnerPage.$('#bShow')                         ||
+    await partnerPage.$('input[name="bShow"]')            ||
+    await partnerPage.$('button[type="submit"]')          ||
+    await partnerPage.$('input[type="submit"]');
+
   if (showBtn) {
+    const btnVal = await partnerPage.evaluate(el => el.value || el.textContent, showBtn);
+    console.log(`[PP] Show butonu bulundu: "${btnVal}"`);
     await showBtn.click();
     await partnerPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
     await sleep(2000);
+    // DEBUG: Show sonrası
+    await sendScreenshot(partnerPage, `📊 Show sonrası: ${hotelName} | ${fromStr}-${tillStr}`);
   } else {
-    console.warn('[PP] Show butonu bulunamadı, devam ediliyor...');
+    console.warn('[PP] Show butonu bulunamadı!');
+    await sendScreenshot(partnerPage, `⚠️ Show butonu YOK: ${hotelName}`);
   }
 
+  // ── Fiyat çek ──
   const ppResult = await partnerPage.evaluate(() => {
     const greens = document.querySelectorAll("font[color='#339933']");
     for (const g of greens) {
@@ -304,6 +386,9 @@ async function fetchPpPrice(partnerPage, hotelName, checkIn) {
   });
 
   if (!ppResult) {
+    // DEBUG: fiyat bulunamadı — son durumu gönder
+    await sendScreenshot(partnerPage, `❌ Fiyat bulunamadı: ${hotelName}`);
+    await sendHtmlDebug(partnerPage, `Fiyat YOK sonrası HTML — ${hotelName}`);
     await sendMsg(`⚠️ [3a] PP fiyatı çekilemedi\nKontrat henüz açılmamış olabilir.`);
     throw new Error(`PP fiyatı bulunamadı: ${hotelName} (kontrat açılmamış olabilir)`);
   }
@@ -547,7 +632,7 @@ async function processOne(job, browser, partnerPage, eurRate) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log('=== Pricer v4 başlıyor ===');
+  console.log('=== Pricer v4+debug başlıyor ===');
   if (!TELEGRAM_BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN eksik');
   if (!PARTNER_USER || !PARTNER_PASS) throw new Error('PARTNER_USER veya PARTNER_PASS eksik');
 
@@ -587,7 +672,6 @@ async function main() {
     processQueue();
   }
 
-  // EUR kuru saatte bir yenile
   setInterval(async () => {
     const r = await fetchEurRate();
     if (r) { eurRate = r; console.log(`[Kur] Güncellendi: ${eurRate}`); }
@@ -640,7 +724,6 @@ async function main() {
         const peninsulaEUR = parseInt(penEurStr, 10);
         let   rivalEUR     = parseInt(rivalEurStr, 10);
 
-        // Hızlı re-scrape: fark hâlâ geçerli mi?
         try {
           const fresh = await quickScrape(hotelId, checkIn);
           if (fresh && fresh.rivalMin) {
